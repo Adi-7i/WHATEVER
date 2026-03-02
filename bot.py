@@ -398,12 +398,15 @@ def format_debug_html(text: str) -> str:
 
 def detect_message_type(text: str, message_type: str = "normal") -> str:
     requested = (message_type or "normal").strip().lower()
-    if requested in {"deep", "code", "debug"}:
+    if requested in {"deep", "code", "debug", "image"}:
         return requested
 
     payload = _normalize_newlines(text)
     if not payload:
         return "normal"
+
+    if "<b>image analysis</b>" in payload.lower():
+        return "image"
 
     if _looks_like_code(payload):
         return "code"
@@ -434,6 +437,9 @@ async def safe_send_message(chat_id: int, text: str, message_type: str = "normal
     elif resolved_type == "debug":
         parse_mode = "HTML"
         chunks = split_sections(format_debug_html(payload), max_chars=3800)
+    elif resolved_type == "image":
+        parse_mode = "HTML"
+        chunks = split_sections(payload, max_chars=3800)
     else:
         parse_mode = None
         chunks = split_message(_sanitize_plain(payload), max_chars=3900)
@@ -456,52 +462,64 @@ def _is_image_document(filename: str, mime_type: str) -> bool:
     return mime_type.startswith("image/") or lower.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"))
 
 
-async def _analyze_image_async(image_bytes: bytes, mime_type: str, user_caption: str) -> str:
-    b64 = base64.b64encode(image_bytes).decode("utf-8")
-    prompt = user_caption.strip() or "Analyze this image."
-
-    response = await vision_client.chat.completions.create(
-        model=vision_model,
-        temperature=0.2,
-        max_tokens=1200,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are WilloFire, created by lucifer and powered by Cynerza Systems Private Limited. "
-                    "Provide professional structured image analysis. "
-                    "Do not hallucinate. If unclear, say: 'Some parts are unclear, based on visible elements...'. "
-                    "If image includes code/errors, provide corrected code and debugging explanation. "
-                    "Use this exact format:\n"
-                    "🖼 Image Analysis:\n"
-                    "📖 Extracted Content:\n"
-                    "🧠 Interpretation:\n"
-                    "🛠 If image shows error or code:\n"
-                    "Never say you are an AI model. Never mention OpenAI."
-                ),
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:{mime_type};base64,{b64}"},
-                    },
-                ],
-            },
-        ],
+async def handle_smart_image(image_bytes: bytes) -> str:
+    b64_image = base64.b64encode(image_bytes).decode("utf-8")
+    prompt = (
+        "You are an expert technical image analyst.\n"
+        "Analyze the image thoroughly.\n"
+        "Extract text precisely.\n"
+        "If code or error present, debug it.\n"
+        "Do not hallucinate.\n"
+        "If something unclear, mention uncertainty.\n\n"
+        "Always respond using SAFE HTML formatting.\n"
+        "Allowed tags only:\n"
+        "<b>\n"
+        "<pre>\n"
+        "<code>\n\n"
+        "Do NOT use MarkdownV2.\n"
+        "Do NOT use unsupported HTML tags.\n"
+        "Do NOT use bullet hyphens.\n"
+        "Use • bullet symbol only.\n\n"
+        "Format:\n\n"
+        "<b>Image Analysis</b>\n\n"
+        "Clear description of what is visible.\n\n"
+        "<b>Extracted Content</b>\n\n"
+        "Visible text or code.\n\n"
+        "<b>Technical Interpretation</b>\n\n"
+        "Explanation of meaning.\n\n"
+        "If error detected:\n\n"
+        "<b>Issue Detected</b>\n\n"
+        "Explanation.\n\n"
+        "<b>Suggested Fix</b>\n\n"
+        "<pre><code>\n"
+        "corrected code if applicable\n"
+        "</code></pre>\n\n"
+        "<b>Confidence</b>\n\n"
+        "High / Medium / Low based on clarity."
     )
 
-    return response.choices[0].message.content or "Some parts are unclear, based on visible elements..."
-
-
-def run_image_analysis(image_bytes: bytes, mime_type: str, user_caption: str) -> str:
     try:
-        return asyncio.run(_analyze_image_async(image_bytes, mime_type, user_caption))
-    except Exception:
-        logging.exception("image analysis failed")
-        return "Some parts are unclear, based on visible elements..."
+        response = await vision_client.chat.completions.create(
+            model=vision_model,
+            temperature=0.0,
+            max_tokens=1500,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"},
+                        },
+                    ],
+                },
+            ],
+        )
+        return response.choices[0].message.content or "<b>Image Analysis</b>\n\nNo visible content detected."
+    except Exception as e:
+        logging.exception("Vision analysis failed")
+        return f"<b>Image Analysis</b>\n\nFailed to process image: {html.escape(str(e))}"
 
 
 @bot.message_handler(commands=["start", "help"])
@@ -519,17 +537,15 @@ def handle_photo(message):
             photo = message.photo[-1]
             file_info = bot.get_file(photo.file_id)
             image_bytes = bot.download_file(file_info.file_path)
-            caption = (message.caption or "").strip()
-            result = run_image_analysis(image_bytes=image_bytes, mime_type="image/jpeg", user_caption=caption)
-            asyncio.run(safe_send_message(chat_id, result))
+            result = asyncio.run(handle_smart_image(image_bytes))
+            asyncio.run(safe_send_message(chat_id, result, message_type="image"))
         except Exception as exc:
             logging.exception("photo handler failed")
             asyncio.run(
                 safe_send_message(
                     chat_id,
-                    "Some parts are unclear, based on visible elements... "
-                    f"Error: {str(exc)[:160]}",
-                    message_type="normal",
+                    f"<b>Image Analysis</b>\n\nError: {html.escape(str(exc)[:160])}",
+                    message_type="image",
                 )
             )
 
@@ -551,17 +567,15 @@ def handle_document(message):
 
             file_info = bot.get_file(doc.file_id)
             image_bytes = bot.download_file(file_info.file_path)
-            caption = (message.caption or "").strip()
-            result = run_image_analysis(image_bytes=image_bytes, mime_type=mime_type, user_caption=caption)
-            asyncio.run(safe_send_message(chat_id, result))
+            result = asyncio.run(handle_smart_image(image_bytes))
+            asyncio.run(safe_send_message(chat_id, result, message_type="image"))
         except Exception as exc:
             logging.exception("document handler failed")
             asyncio.run(
                 safe_send_message(
                     chat_id,
-                    "Some parts are unclear, based on visible elements... "
-                    f"Error: {str(exc)[:160]}",
-                    message_type="normal",
+                    f"<b>Image Analysis</b>\n\nError: {html.escape(str(exc)[:160])}",
+                    message_type="image",
                 )
             )
 
