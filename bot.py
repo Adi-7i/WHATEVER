@@ -49,6 +49,10 @@ def run_orchestration(query: str) -> str:
     return result.response_text
 
 
+def run_deep_orchestration(query: str) -> str:
+    return asyncio.run(orchestrator.handle_deep_research(query))
+
+
 @bot.message_handler(commands=["start", "help"])
 def handle_start(message):
     bot.reply_to(
@@ -65,6 +69,38 @@ def handle_text(message):
 
     if not query:
         bot.reply_to(message, "Send a valid text query.")
+        return
+
+    if query.startswith("/deep"):
+        parts = query.split(maxsplit=1)
+        deep_query = parts[1].strip() if len(parts) > 1 else ""
+        if not deep_query:
+            bot.reply_to(message, "Usage: /deep <query>")
+            return
+
+        with locks[user_id]:
+            status = bot.send_message(chat_id, "Deep research in progress...")
+            try:
+                report = run_deep_orchestration(deep_query)
+                chunks = split_message(report)
+                bot.edit_message_text(
+                    chunks[0],
+                    chat_id=chat_id,
+                    message_id=status.message_id,
+                )
+                for extra in chunks[1:]:
+                    bot.send_message(chat_id, extra)
+            except Exception as exc:
+                logging.exception("deep research failed")
+                bot.edit_message_text(
+                    (
+                        "Available evidence indicates a temporary deep-research issue. "
+                        "Please retry with a narrower query. "
+                        f"Error: {str(exc)[:200]}"
+                    ),
+                    chat_id=chat_id,
+                    message_id=status.message_id,
+                )
         return
 
     with locks[user_id]:

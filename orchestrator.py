@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from openai import AsyncAzureOpenAI, AsyncOpenAI
 
 from config import Settings
+from deep_research import configure_deep_research, run_deep_research
 from intent import IntentType, RuleBasedIntentClassifier
 from scraper import ArticleScraper
 from search import SearXNGClient
@@ -33,9 +34,20 @@ class QueryOrchestrator:
             max_words=settings.article_word_limit,
             concurrency=settings.scraper_concurrency,
         )
+        self.deep_scraper = ArticleScraper(
+            timeout_seconds=settings.scraper_timeout_seconds,
+            max_words=1500,
+            concurrency=settings.scraper_concurrency,
+        )
 
         llm_client, model = self._build_llm_client(settings)
         self.summarizer = Summarizer(client=llm_client, model=model)
+        configure_deep_research(
+            search_client=self.search_client,
+            scraper=self.deep_scraper,
+            client=llm_client,
+            model=model,
+        )
 
     async def handle_query(self, user_text: str) -> OrchestrationResult:
         intent = self.classifier.classify(user_text)
@@ -82,6 +94,9 @@ class QueryOrchestrator:
             scraped_articles_count=len(scraped_articles),
             response_text=final,
         )
+
+    async def handle_deep_research(self, user_text: str) -> str:
+        return await run_deep_research(user_text)
 
     @staticmethod
     def _build_llm_client(settings: Settings) -> tuple[AsyncOpenAI | AsyncAzureOpenAI, str]:
