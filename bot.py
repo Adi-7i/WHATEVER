@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import html
 import logging
 import mimetypes
 import re
@@ -25,7 +26,7 @@ logging.basicConfig(
 settings = load_settings()
 validate_settings(settings)
 
-bot = telebot.TeleBot(settings.telegram_bot_token, parse_mode="Markdown")
+bot = telebot.TeleBot(settings.telegram_bot_token, parse_mode=None)
 orchestrator = QueryOrchestrator(settings=settings)
 
 locks = defaultdict(threading.Lock)
@@ -60,12 +61,12 @@ vision_client, vision_model = _build_async_llm_client(settings)
 
 
 IDENTITY_RESPONSE = (
-    "*WilloFire*\n"
+    "WilloFire\n"
     "Created by: lucifer\n"
     "Powered by: Cynerza Systems Private Limited\n\n"
     "WilloFire is a professional AI assistant with:\n"
     "- Smart AI Assistance\n"
-    "- Deep Research (`/deep <query>`)\n"
+    "- Deep Research (/deep <query>)\n"
     "- Advanced Code Debugging\n"
     "- Image Understanding and Analysis\n"
     "- Multilingual Communication"
@@ -73,12 +74,12 @@ IDENTITY_RESPONSE = (
 
 
 START_MESSAGE = (
-    "Welcome to *WilloFire* 🔥\n\n"
+    "Welcome to WilloFire\n\n"
     "Created by: lucifer\n"
     "Powered by: Cynerza Systems Private Limited\n\n"
     "Core Features:\n"
     "- Smart AI Assistant\n"
-    "- Deep Research Mode (`/deep <query>`)\n"
+    "- Deep Research Mode (/deep <query>)\n"
     "- Advanced Code Debugging\n"
     "- Image Understanding & Analysis\n"
     "- Multilingual Support\n\n"
@@ -108,14 +109,77 @@ CODE_HINT_PATTERNS = [
 ]
 
 
+DEEP_SECTION_ORDER = [
+    "Executive Summary",
+    "Background",
+    "Key Developments",
+    "Strategic Implications",
+    "Conclusion",
+    "Confidence Level",
+]
+
+
+DEEP_SECTION_ALIASES = {
+    "executive summary": "Executive Summary",
+    "background": "Background",
+    "key developments": "Key Developments",
+    "strategic implications": "Strategic Implications",
+    "conclusion": "Conclusion",
+    "confidence": "Confidence Level",
+    "confidence level": "Confidence Level",
+}
+
+
+def _normalize_newlines(text: str) -> str:
+    return (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
 def split_message(text: str, max_chars: int = 3900) -> list[str]:
-    payload = (text or "").strip() or "Available evidence indicates partial certainty; generated best effort answer."
+    payload = _normalize_newlines(text) or "Available evidence indicates partial certainty; generated best effort answer."
+    if len(payload) <= max_chars:
+        return [payload]
     return [payload[i : i + max_chars] for i in range(0, len(payload), max_chars)]
 
 
-def reply_large(chat_id: int, text: str) -> None:
-    for part in split_message(text):
-        bot.send_message(chat_id, part)
+def split_sections(text: str, max_chars: int = 3900) -> list[str]:
+    payload = _normalize_newlines(text) or "Available evidence indicates partial certainty; generated best effort answer."
+    if len(payload) <= max_chars:
+        return [payload]
+
+    blocks = [b.strip() for b in payload.split("\n\n") if b.strip()]
+    chunks: list[str] = []
+    current = ""
+
+    for block in blocks:
+        candidate = block if not current else f"{current}\n\n{block}"
+        if len(candidate) <= max_chars:
+            current = candidate
+            continue
+
+        if current:
+            chunks.append(current)
+
+        if len(block) <= max_chars:
+            current = block
+            continue
+
+        over = split_message(block, max_chars=max_chars)
+        chunks.extend(over[:-1])
+        current = over[-1]
+
+    if current:
+        chunks.append(current)
+
+    return chunks or [payload[:max_chars]]
+
+
+def _sanitize_plain(text: str) -> str:
+    payload = _normalize_newlines(text)
+    payload = re.sub(r"</?b>", "", payload, flags=re.IGNORECASE)
+    payload = re.sub(r"</?i>", "", payload, flags=re.IGNORECASE)
+    payload = re.sub(r"</?pre>", "", payload, flags=re.IGNORECASE)
+    payload = re.sub(r"</?code>", "", payload, flags=re.IGNORECASE)
+    return payload
 
 
 def run_orchestration(query: str) -> str:
@@ -185,27 +249,206 @@ def build_debug_prompt(user_input: str) -> str:
     )
 
 
-def format_code_blocks(text: str) -> str:
-    if not text:
-        return text
-    if "```" in text:
-        return text
+def _is_indented_block(text: str) -> bool:
+    lines = [line for line in _normalize_newlines(text).splitlines() if line.strip()]
+    if len(lines) < 2:
+        return False
+    return any(line.startswith("    ") or line.startswith("\t") for line in lines)
 
-    has_code_signal = any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in CODE_HINT_PATTERNS)
-    if not has_code_signal:
-        return text
 
-    fixed_header = "🛠 Fixed Code:"
-    explain_header = "📌 Explanation:"
+def _looks_like_code(text: str) -> bool:
+    source = _normalize_newlines(text)
+    if not source:
+        return False
 
-    if fixed_header in text and explain_header in text:
-        before, after_fixed = text.split(fixed_header, maxsplit=1)
-        code_part, after_explain = after_fixed.split(explain_header, maxsplit=1)
-        code_block = code_part.strip()
-        wrapped = f"```python\n{code_block}\n```"
-        return f"{before.strip()}\n\n{fixed_header}\n{wrapped}\n\n{explain_header}{after_explain}"
+    lowered = source.lower()
+    if "traceback" in lowered or "syntaxerror" in lowered:
+        return True
 
-    return f"```python\n{text.strip()}\n```"
+    if _is_indented_block(source):
+        return True
+
+    return any(re.search(pattern, source, flags=re.IGNORECASE) for pattern in CODE_HINT_PATTERNS)
+
+
+def _normalize_section_key(line: str) -> str:
+    cleaned = line.strip().rstrip(":").strip()
+    return DEEP_SECTION_ALIASES.get(cleaned.lower(), "")
+
+
+def _extract_sections(text: str) -> dict[str, str]:
+    lines = _normalize_newlines(text).splitlines()
+    section_lines: dict[str, list[str]] = {key: [] for key in DEEP_SECTION_ORDER}
+    current_section = ""
+
+    for line in lines:
+        maybe_section = _normalize_section_key(line)
+        if maybe_section:
+            current_section = maybe_section
+            continue
+        if current_section:
+            section_lines[current_section].append(line)
+
+    result: dict[str, str] = {}
+    for key in DEEP_SECTION_ORDER:
+        value = "\n".join(section_lines[key]).strip()
+        if value:
+            result[key] = value
+
+    return result
+
+
+def _looks_like_deep_structured(text: str) -> bool:
+    payload = _normalize_newlines(text)
+    if not payload:
+        return False
+
+    lines = [line.strip().rstrip(":").strip().lower() for line in payload.splitlines() if line.strip()]
+    if not lines:
+        return False
+
+    if lines[0] in DEEP_SECTION_ALIASES:
+        return True
+
+    section_hits = sum(1 for line in lines[:20] if line in DEEP_SECTION_ALIASES)
+    return section_hits >= 2
+
+
+def _escape_html_text(text: str) -> str:
+    return html.escape(_normalize_newlines(text), quote=False)
+
+
+def _normalize_bullet_line(line: str) -> str:
+    content = re.sub(r"^[\-\*\u2022]\s*", "", line.strip())
+    return f"• {content}" if content else ""
+
+
+def format_deep_research_html(text: str) -> str:
+    sections = _extract_sections(text)
+    if not sections:
+        sections["Executive Summary"] = _normalize_newlines(text) or "Not available."
+
+    out: list[str] = []
+    for section in DEEP_SECTION_ORDER:
+        content = sections.get(section, "").strip()
+        if not content:
+            continue
+
+        out.append(f"<b>{section}</b>")
+        out.append("")
+
+        if section == "Key Developments":
+            lines = [line for line in content.splitlines() if line.strip()]
+            if not lines:
+                lines = [content]
+            for line in lines:
+                out.append(_escape_html_text(_normalize_bullet_line(line)))
+        elif section == "Confidence Level":
+            confidence_line = content.splitlines()[0].strip()
+            rest = "\n".join(content.splitlines()[1:]).strip()
+            out.append(_escape_html_text(confidence_line))
+            if rest:
+                out.append("")
+                out.append(_escape_html_text(rest))
+        else:
+            out.append(_escape_html_text(content))
+
+        out.append("")
+
+    return "\n".join(out).strip()
+
+
+def format_code_html(text: str) -> list[str]:
+    chunks = split_message(text, max_chars=3400)
+    return [f"<pre><code>{html.escape(chunk, quote=False)}</code></pre>" for chunk in chunks]
+
+
+def format_debug_html(text: str) -> str:
+    payload = _normalize_newlines(text)
+
+    issue_match = re.search(
+        r"(Issue Found:|🔎\s*Issue Found:)(.*?)(Fixed Code:|🛠\s*Fixed Code:)",
+        payload,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    code_match = re.search(
+        r"(Fixed Code:|🛠\s*Fixed Code:)(.*?)(Explanation:|📌\s*Explanation:)",
+        payload,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    explanation_match = re.search(
+        r"(Explanation:|📌\s*Explanation:)(.*)$",
+        payload,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    issue = issue_match.group(2).strip() if issue_match else "Code issue detected."
+    fixed_code = code_match.group(2).strip() if code_match else payload
+    explanation = explanation_match.group(2).strip() if explanation_match else "Applied a safe correction."
+
+    return (
+        "<b>Issue Found</b>\n\n"
+        f"{_escape_html_text(issue)}\n\n"
+        "<b>Fixed Code</b>\n\n"
+        f"<pre><code>{html.escape(fixed_code, quote=False)}</code></pre>\n\n"
+        "<b>Explanation</b>\n\n"
+        f"{_escape_html_text(explanation)}"
+    )
+
+
+def detect_message_type(text: str, message_type: str = "normal") -> str:
+    requested = (message_type or "normal").strip().lower()
+    if requested in {"deep", "code", "debug"}:
+        return requested
+
+    payload = _normalize_newlines(text)
+    if not payload:
+        return "normal"
+
+    if _looks_like_code(payload):
+        return "code"
+
+    if _looks_like_deep_structured(payload):
+        return "deep"
+
+    return "normal"
+
+
+async def _send_message_async(chat_id: int, text: str, parse_mode: str | None = None):
+    return await asyncio.to_thread(bot.send_message, chat_id, text, parse_mode=parse_mode)
+
+
+async def safe_send_message(chat_id: int, text: str, message_type: str = "normal"):
+    payload = _normalize_newlines(text) or "Available evidence indicates partial certainty; generated best effort answer."
+    resolved_type = detect_message_type(payload, message_type=message_type)
+
+    parse_mode: str | None
+    chunks: list[str]
+
+    if resolved_type == "code":
+        parse_mode = "HTML"
+        chunks = format_code_html(payload)
+    elif resolved_type == "deep":
+        parse_mode = "HTML"
+        chunks = split_sections(format_deep_research_html(payload), max_chars=3800)
+    elif resolved_type == "debug":
+        parse_mode = "HTML"
+        chunks = split_sections(format_debug_html(payload), max_chars=3800)
+    else:
+        parse_mode = None
+        chunks = split_message(_sanitize_plain(payload), max_chars=3900)
+
+    for chunk in chunks:
+        try:
+            await _send_message_async(chat_id, chunk, parse_mode=parse_mode)
+        except Exception:
+            logging.exception("Telegram send failed with parse_mode=%s; retrying plain text", parse_mode)
+            plain = _sanitize_plain(html.unescape(re.sub(r"<[^>]+>", "", chunk)))
+            await _send_message_async(
+                chat_id,
+                plain or "Available evidence indicates partial certainty; generated best effort answer.",
+                parse_mode=None,
+            )
 
 
 def _is_image_document(filename: str, mime_type: str) -> bool:
@@ -263,7 +506,7 @@ def run_image_analysis(image_bytes: bytes, mime_type: str, user_caption: str) ->
 
 @bot.message_handler(commands=["start", "help"])
 def handle_start(message):
-    bot.reply_to(message, START_MESSAGE)
+    asyncio.run(safe_send_message(message.chat.id, START_MESSAGE, message_type="normal"))
 
 
 @bot.message_handler(content_types=["photo"])
@@ -278,13 +521,16 @@ def handle_photo(message):
             image_bytes = bot.download_file(file_info.file_path)
             caption = (message.caption or "").strip()
             result = run_image_analysis(image_bytes=image_bytes, mime_type="image/jpeg", user_caption=caption)
-            reply_large(chat_id, format_code_blocks(result))
+            asyncio.run(safe_send_message(chat_id, result))
         except Exception as exc:
             logging.exception("photo handler failed")
-            bot.send_message(
-                chat_id,
-                "Some parts are unclear, based on visible elements... "
-                f"Error: {str(exc)[:160]}",
+            asyncio.run(
+                safe_send_message(
+                    chat_id,
+                    "Some parts are unclear, based on visible elements... "
+                    f"Error: {str(exc)[:160]}",
+                    message_type="normal",
+                )
             )
 
 
@@ -300,20 +546,23 @@ def handle_document(message):
             mime_type = doc.mime_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
             if not _is_image_document(filename, mime_type):
-                bot.send_message(chat_id, "Please upload an image file for image analysis.")
+                asyncio.run(safe_send_message(chat_id, "Please upload an image file for image analysis.", message_type="normal"))
                 return
 
             file_info = bot.get_file(doc.file_id)
             image_bytes = bot.download_file(file_info.file_path)
             caption = (message.caption or "").strip()
             result = run_image_analysis(image_bytes=image_bytes, mime_type=mime_type, user_caption=caption)
-            reply_large(chat_id, format_code_blocks(result))
+            asyncio.run(safe_send_message(chat_id, result))
         except Exception as exc:
             logging.exception("document handler failed")
-            bot.send_message(
-                chat_id,
-                "Some parts are unclear, based on visible elements... "
-                f"Error: {str(exc)[:160]}",
+            asyncio.run(
+                safe_send_message(
+                    chat_id,
+                    "Some parts are unclear, based on visible elements... "
+                    f"Error: {str(exc)[:160]}",
+                    message_type="normal",
+                )
             )
 
 
@@ -324,28 +573,27 @@ def handle_text(message):
     query = (message.text or "").strip()
 
     if not query:
-        bot.reply_to(message, "Send a valid text query.")
+        asyncio.run(safe_send_message(chat_id, "Send a valid text query.", message_type="normal"))
         return
 
     if query.startswith("/deep"):
         parts = query.split(maxsplit=1)
         deep_query = parts[1].strip() if len(parts) > 1 else ""
         if not deep_query:
-            bot.reply_to(message, "Usage: /deep <query>")
+            asyncio.run(safe_send_message(chat_id, "Usage: /deep <query>", message_type="normal"))
             return
 
         with locks[user_id]:
-            status = bot.send_message(chat_id, "Deep research in progress...")
+            status = bot.send_message(chat_id, "Deep research in progress...", parse_mode=None)
             try:
                 report = run_deep_orchestration(deep_query)
-                chunks = split_message(format_code_blocks(report))
                 bot.edit_message_text(
-                    chunks[0],
+                    "Deep research completed.",
                     chat_id=chat_id,
                     message_id=status.message_id,
+                    parse_mode=None,
                 )
-                for extra in chunks[1:]:
-                    bot.send_message(chat_id, extra)
+                asyncio.run(safe_send_message(chat_id, report, message_type="deep"))
             except Exception as exc:
                 logging.exception("deep research failed")
                 bot.edit_message_text(
@@ -356,18 +604,20 @@ def handle_text(message):
                     ),
                     chat_id=chat_id,
                     message_id=status.message_id,
+                    parse_mode=None,
                 )
         return
 
     if is_identity_query(query):
-        bot.send_message(chat_id, IDENTITY_RESPONSE)
+        asyncio.run(safe_send_message(chat_id, IDENTITY_RESPONSE, message_type="normal"))
         return
 
     with locks[user_id]:
         try:
-            final_query = build_debug_prompt(query) if is_debug_query(query) else query
+            debug_mode = is_debug_query(query)
+            final_query = build_debug_prompt(query) if debug_mode else query
             response_text = run_orchestration(final_query)
-            reply_large(chat_id, format_code_blocks(response_text))
+            asyncio.run(safe_send_message(chat_id, response_text, message_type="debug" if debug_mode else "normal"))
         except Exception as exc:
             logging.exception("orchestration failed")
             fallback = (
@@ -375,7 +625,7 @@ def handle_text(message):
                 "Please retry with a slightly more specific query. "
                 f"Error: {str(exc)[:200]}"
             )
-            bot.send_message(chat_id, fallback)
+            asyncio.run(safe_send_message(chat_id, fallback, message_type="normal"))
 
 
 if __name__ == "__main__":
